@@ -1,0 +1,10 @@
+# Written by herdr-app for editors.
+*.d.ts
+jsconfig.json
+# Fetched at build time by the NixOS config (third-party art and icon sets):
+# never commit them here.
+mods/discord-kit/avatars/*.png
+mods/discord-kit/gifs/
+mods/discord-kit/icons/
+mods/discord-kit/lucide/
+mods/discord-kit/brands/

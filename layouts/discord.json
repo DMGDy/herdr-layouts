@@ -268,5 +268,6 @@
     12
   ],
   "titlebar": "none",
-  "terminal_opacity": 0.6
+  "terminal_opacity": 0.6,
+  "preview": "layouts/discord.png"
 }

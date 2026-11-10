@@ -201,11 +201,13 @@ function attachments(text) {
   return { text: rest.trim(), pics };
 }
 
-// A prompt line's text: one from another agent arrives as <hc from="t1">…</hc>,
+// A prompt line's text: one sent with hc (another agent, or a Herdr app's
+// message box, here or on another machine) arrives as <hc from="t1">…</hc>,
 // and a queued one carries Claude's send-now hint.
+const HC_OPEN = /<hc from="([^"]+)">\s*/;
 function prompt(text) {
-  const from = text.match(/^<hc from="([^"]+)">/)?.[1] ?? null;
-  return { from, text: text.replace(/^<hc from="[^"]*">\s*/, "").replace(/\s*<\/hc>\s*$/, "").replace(/\s*ctrl\+enter to send now\s*$/i, "") };
+  const from = text.match(HC_OPEN)?.[1] ?? null;
+  return { from, text: text.replace(HC_OPEN, "").replace(/\s*<\/hc>\s*/, " ").replace(/\s*ctrl\+enter to send now\s*$/i, "").trim() };
 }
 
 // The agents whose session files the chat reads, by the app they report.
@@ -718,6 +720,15 @@ export default class Output extends View {
           if (!claude && norm(parts.join(" ")).length >= (mine?.length ?? 0)) break;
         }
         const p = prompt(norm(parts.join(" ")));
+        push({ who: "you", text: p.text, from: p.from, idx });
+        continue;
+      }
+      // A message sent with hc, as an agent without prompt marks (pi) shows it:
+      // <hc from="…">…</hc>, maybe over several lines.
+      if (!claude && /^\s*<hc from="[^"]+">/.test(line)) {
+        const parts = [norm(line)], idx = [i];
+        while (!parts[parts.length - 1].includes("</hc>") && i + 1 < L.length && idx.length < 40) { i++; parts.push(norm(L[i])); idx.push(i); }
+        const p = prompt(parts.join(" "));
         push({ who: "you", text: p.text, from: p.from, idx });
         continue;
       }

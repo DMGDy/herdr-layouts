@@ -39,19 +39,23 @@ function textOf(m) {
 }
 const usesTools = (m) => Array.isArray(m.content) && m.content.some((c) => c?.type === "toolCall");
 
-// Adds numbered lines to the session's entries. A line pi is still writing
-// doesn't parse yet: stop there and read it again next time.
+// Adds numbered lines to the session's entries. The last line may be one pi
+// is still writing: stop there and read it again next time. An unreadable
+// line with more after it is damage (a crash can leave a line of zero bytes)
+// and is skipped.
 function take(s, stdout) {
   let added = false;
-  for (const raw of stdout.split("\n")) {
+  const rows = stdout.split("\n").filter((r) => r.includes("\t"));
+  for (const [k, raw] of rows.entries()) {
     const tab = raw.indexOf("\t");
-    if (tab < 0) continue;
     const n = Number(raw.slice(0, tab)), body = raw.slice(tab + 1);
     let e;
     if (body.startsWith("STUB")) e = { id: body.match(/"id":"([^"]*)"/)?.[1], parentId: body.match(/"parentId":"([^"]*)"/)?.[1] ?? null };
-    else { try { e = JSON.parse(body); } catch (_e) { break; } }
+    else { try { e = JSON.parse(body); } catch (_e) { if (k === rows.length - 1) break; s.line = n; continue; } }
     s.line = n;
     if (!e?.id) continue;
+    e.order = (s.order ??= []).length;
+    s.order.push(e.id);
     s.byId.set(e.id, e);
     s.leaf = e.id;
     added = true;
@@ -63,7 +67,9 @@ function take(s, stdout) {
 // session branches when you go back and change something; only this branch counts).
 function chain(s) {
   const out = [], seen = new Set();
-  for (let e = s.byId.get(s.leaf); e && !seen.has(e.id); e = e.parentId ? s.byId.get(e.parentId) : null) {
+  // A parent lost to a damaged line is bridged by the entry before it in the file.
+  for (let e = s.byId.get(s.leaf); e && !seen.has(e.id);
+    e = e.parentId ? s.byId.get(e.parentId) ?? (e.order > 0 ? s.byId.get(s.order[e.order - 1]) : null) : null) {
     seen.add(e.id);
     out.push(e);
   }

@@ -12,15 +12,16 @@
 // A second copy (props.side) is the chat beside a watched stream (Watch Stream
 // with chat): it follows the streamed agent and leaves the background work
 // (other channels, timings) to the first.
-// A pi or Claude Code channel reads the agent's own session file (pi.js,
-// claude.js): every message at any time, with exact times; everything else
-// reads the terminal's text.
+// A pi, Claude Code or Codex channel reads the agent's own session file
+// (pi.js, claude.js, codex.js): every message at any time, with exact times;
+// everything else reads the terminal's text.
 import { View, div, image } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import { hc, run, spaces, panes, terminals, focused, layout, notify, settings, nextCommand, shared, setShared, appHome, exec, props } from "herdr";
 import * as fs from "fs/promises";
 import * as piSession from "./pi.js";
 import * as claudeSession from "./claude.js";
+import * as codexSession from "./codex.js";
 import { C, icon, avatar, picture, dots, peek, watch, stopWatching, openThread, closeThread, splitOn, node, streamChatOn, chatSub, openSub, merged, herd, descendants, typing, ME, ROLES, kittenName, portrait, lore } from "./kit.js";
 
 const ROW = 20, CHAR = 7.85, FONT = 13, YOU_CHAR = 8.1, YOU_ROW = 21;
@@ -36,7 +37,10 @@ const CODE = (l) => /^\s{4,}\S/.test(l) || /^\s*\$\s/.test(l) || /[─━│┃�
 // (in place of its |---| line).
 const TABLE_ROW = /^\s*\|.*\|\s*$/;
 function table(rows) {
-  const cells = rows.map((x) => x.l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim().replace(/\*\*(.*?)\*\*/g, "$1")));
+  // A cell's markdown, as plain text (columns are fixed-width): no backticks or
+  // bold marks, a link as its title.
+  const plain = (c) => c.trim().replace(/\*\*(.*?)\*\*/g, "$1").replace(/`([^`]*)`/g, "$1").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  const cells = rows.map((x) => x.l.trim().replace(/^\||\|$/g, "").split("|").map(plain));
   const rule = (r) => r.every((c) => /^:?-{2,}:?$/.test(c));
   const body = cells.filter((r) => !rule(r));
   const n = Math.max(...body.map((r) => r.length)), w = Array.from({ length: n }, (_, k) => Math.max(...body.map((r) => (r[k] ?? "").length)));
@@ -50,8 +54,8 @@ function table(rows) {
 }
 
 // A reply's markdown (pi's and Claude's own text): fenced blocks are code, the
-// fences go, tables line up, headings lose their #s and are bold, and **bold**
-// marks come off.
+// fences go, tables line up, headings lose their #s and are bold; the rest is
+// marked md, for inline markdown (`code`, [links](…), **bold**: wrapRich).
 function markdown(lines) {
   const out = [];
   let fence = false;
@@ -67,10 +71,117 @@ function markdown(lines) {
       continue;
     }
     const head = x.l.match(/^\s*#{1,6}\s+(.*)$/);
-    const l = (head ? head[1] : x.l).replace(/\*\*(\S(?:.*?\S)?)\*\*/g, "$1");
-    out.push(head ? { ...x, l, bold: true } : { ...x, l });
+    const l = (head ? head[1] : x.l).replace(/\*\*(\S(?:.*?\S)?)\*\*/g, head ? "$1" : "**$1**");
+    out.push(head ? { ...x, l, bold: true } : { ...x, l, md: true });
   }
   return out;
+}
+
+// Inline markdown: `code`, [text](url), **bold** and bare links, as the
+// line's parts in order ({ text } plain, or with code, url or bold). A code
+// span opens with a run of backticks and closes at the next run of the same
+// length (so ``a `b` c`` holds backticks); one space just inside both ends
+// goes, as in Markdown. Code comes first: nothing inside it is markdown. Then
+// ** pairs make what's between them bold, code and links included (an
+// unpaired one stays as it is).
+const INLINE = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<>)\]]*[^\s<>)\].,;:!?'"])/g;
+const HAS_INLINE = /`|\]\(https?:|\*\*|https?:\/\//;
+function inline(text) {
+  const out = [];
+  const plain = (t) => {
+    let at = 0, m;
+    INLINE.lastIndex = 0;
+    while ((m = INLINE.exec(t))) {
+      if (m.index > at) out.push({ text: t.slice(at, m.index) });
+      if (m[1] !== undefined) out.push({ text: m[1], url: m[2] });
+      else out.push({ text: m[3], url: m[3] });
+      at = m.index + m[0].length;
+    }
+    if (at < t.length) out.push({ text: t.slice(at) });
+  };
+  let from = 0, i = 0;
+  while (i < text.length) {
+    if (text[i] !== "`") { i++; continue; }
+    let n = 0;
+    while (text[i + n] === "`") n++;
+    // The closing run: exactly n backticks.
+    let j = i + n, close = -1;
+    while (j < text.length) {
+      if (text[j] !== "`") { j++; continue; }
+      let r = 0;
+      while (text[j + r] === "`") r++;
+      if (r === n) { close = j; break; }
+      j += r;
+    }
+    if (close < 0) { i += n; continue; } // unmatched: plain backticks
+    plain(text.slice(from, i));
+    let code = text.slice(i + n, close);
+    if (code.length > 2 && code.startsWith(" ") && code.endsWith(" ") && code.trim()) code = code.slice(1, -1);
+    out.push({ text: code, code: true });
+    from = i = close + n;
+  }
+  plain(text.slice(from));
+  // Bold: ** marks in the plain parts, paired as Markdown does: an opening one
+  // is followed by a non-space, a closing one follows one ("** **" stays).
+  const parts = [];
+  for (const p of out) {
+    if (p.code || p.url || !p.text.includes("**")) { parts.push(p); continue; }
+    p.text.split("**").forEach((b, k) => { if (k > 0) parts.push({ text: "**", mark: true }); if (b) parts.push({ text: b }); });
+  }
+  let open = -1;
+  parts.forEach((p, k) => {
+    if (!p.mark) return;
+    const before = parts[k - 1], after = parts[k + 1];
+    if (open >= 0 && before && !before.mark && !/\s$/.test(before.text)) {
+      for (let j = open + 1; j < k; j++) parts[j].bold = true;
+      parts[open].drop = p.drop = true;
+      open = -1;
+    } else if (after && !after.mark && !/^\s/.test(after.text)) open = k;
+  });
+  return parts.filter((p) => !p.drop && p.text).map(({ mark: _m, drop: _d, ...p }) => p);
+}
+
+// Word-wraps a line of inline markdown to `per` characters: rows of parts,
+// each keeping its style, with the line's indent kept on every row (as
+// wrapWords does). A word longer than a row is cut.
+function wrapRich(line, per) {
+  const lead = line.match(/^\s*/)[0];
+  const indent = line.match(/^\s*([●•⏺]\s|[-*]\s|\d+\.\s)?/)[0].replace(/\S/g, " ").slice(0, Math.floor(per / 2));
+  const words = [];
+  let gap = false;
+  inline(line.slice(lead.length)).forEach(({ text, ...style }, seg) => {
+    for (const bit of text.split(/(\s+)/)) {
+      if (!bit) continue;
+      if (/^\s+$/.test(bit)) { gap = true; continue; }
+      words.push({ text: bit, style, seg, gap });
+      gap = false;
+    }
+  });
+  const rows = [];
+  let row, len, start;
+  const begin = () => { start = rows.length || row ? indent : lead; row = [{ text: start, style: {} }]; len = start.length; };
+  const put = (text, style) => {
+    const last = row[row.length - 1];
+    if (JSON.stringify(last.style) === JSON.stringify(style)) last.text += text; else row.push({ text, style });
+    len += text.length;
+  };
+  begin();
+  let prev = null;
+  for (const w of words) {
+    let text = w.text;
+    if (len > start.length && len + (w.gap ? 1 : 0) + text.length > per) { rows.push(row); begin(); }
+    // A space inside one code span or link keeps its style (one chip, one link).
+    else if (w.gap && len > start.length) put(" ", prev?.seg === w.seg ? w.style : {});
+    prev = w;
+    while (len + text.length > per && text.length > 1) {
+      const room = Math.max(1, per - len);
+      put(text.slice(0, room), w.style); rows.push(row); begin();
+      text = text.slice(room);
+    }
+    put(text, w.style);
+  }
+  rows.push(row);
+  return rows.map((parts) => ({ parts: parts.filter((p) => p.text), text: parts.map((p) => p.text).join("") }));
 }
 
 // Claude's spinner ("✢ Enchanting… (2m 9s · ↓ 11.9k tokens)"), as the kit's SPIN.
@@ -98,9 +209,10 @@ function prompt(text) {
 }
 
 // The agents whose session files the chat reads, by the app they report.
-const SESSIONS = { pi: piSession, claude: claudeSession };
+const SESSIONS = { pi: piSession, claude: claudeSession, codex: codexSession };
 const sessionKind = (app, program) => app === "pi" || program?.key === "pi" ? "pi"
-  : app === "claude-code" || program?.key === "claude" ? "claude" : null;
+  : app === "claude-code" || program?.key === "claude" ? "claude"
+  : app === "codex" || program?.key === "codex" ? "codex" : null;
 
 // A prompt in the transcript is a message you sent: the same start, or (long
 // enough not to be chance) after stray keys already in the agent's input box.
@@ -777,14 +889,15 @@ export default class Output extends View {
       if (!body) {
         // Files sent from the message box: their paths become their pictures.
         const { text: said, pics } = turn.who === "you" ? attachments(turn.text) : { text: "", pics: [] };
-        const lines = turn.who === "you" ? (said ? [{ l: said, i: own ? turn.idx[0] : undefined }] : [])
+        const lines = turn.who === "you" ? (said ? [{ l: said, i: own ? turn.idx[0] : undefined, md: turn.exact }] : [])
           : turn.exact ? markdown(turn.reply.lines.map((l, j) => ({ l, i: own ? turn.reply.idx[j] : undefined })))
           : reflow(turn.reply.lines.map((l, j) => ({ l, i: own ? turn.reply.idx[j] : undefined })));
         const hits = lines.filter((x) => !q || x.l.toLowerCase().includes(q));
         body = { first: hits[0]?.i, rows: [] };
-        for (const { l, i, code, bold } of hits) {
+        for (const { l, i, code, bold, md } of hits) {
           if (!l.trim()) { body.rows.push({ kind: "text", text: "", h: 10, i }); continue; }
           if (turn.who === "agent" && (code || CODE(l))) wrapCode(l, perMono).forEach((c) => body.rows.push({ kind: "code", text: c, h: 20, i }));
+          else if (md && HAS_INLINE.test(l)) wrapRich(l, per).forEach((c, j) => body.rows.push({ kind: "text", text: c.text, parts: c.parts, h: 22, i, s: turn.who === "agent" ? style(l) : {}, first: j === 0 }));
           else wrapWords(l.replace(/^\s*[●⏺]\s?/, ""), per).forEach((c, j) => body.rows.push({ kind: "text", text: c, h: 22, i, s: bold ? { bold: true } : turn.who === "agent" ? style(l) : {}, first: j === 0 }));
         }
         for (const p of pics) body.rows.push({ kind: "image", h: p.h + 8, w: p.w, src: p.thumb, i: own ? turn.idx[0] : undefined, open: () => exec("xdg-open", [p.file]).catch(() => {}) });
@@ -934,6 +1047,15 @@ export default class Output extends View {
     if (r.kind === "code") return row.child(h_flex().w_full().h_full().px(8).items_center().bg(C.panel).border_l(1).border_r(1).border_color(C.input)
       .child(div().font_family(mono).text_size(FONT).whitespace_nowrap().text_color(C.text).child(r.text || " ")));
     const s = r.s ?? {};
+    // Inline markdown: code as a mono chip, links blue (click opens them), bold.
+    if (r.parts) return row.child(h_flex().items_center().text_size(15.5).whitespace_nowrap()
+      .text_color(r.pending ? C.dim : s.color && s.color !== "#0040dd" ? discordColor(s.color) : C.text)
+      .children(r.parts.map(({ text, style: p }, k) => p.code
+        ? div().px(4).mx(1).rounded(4).bg("#0000004d").font_family(mono).text_size(13.5).text_color("#e3e5e8").child(text)
+        : p.url ? div().id(`a-${n}-${k}`).text_color(C.link).cursor_pointer().hover((x) => x.underline())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => { cx.stop_propagation(); exec("xdg-open", [p.url]).catch(() => {}); }).child(text)
+        : p.bold ? div().font_bold().text_color(C.header).child(text) : div().child(text))));
     return row.child(div().text_size(15.5).whitespace_nowrap()
       .text_color(r.pending ? C.dim : s.color && s.color !== "#0040dd" ? discordColor(s.color) : C.text)
       .when(Boolean(s.bold), (x) => x.font_semibold()).when(Boolean(s.italic), (x) => x.italic())

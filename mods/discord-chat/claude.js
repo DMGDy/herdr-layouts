@@ -30,20 +30,26 @@ const run = async (script, args, on) => {
   return r.stdout;
 };
 
-// Adds numbered lines to the session's entries. A line Claude is still
-// writing doesn't parse yet: stop there and read it again next time.
+// Adds numbered lines to the session's entries. The last line may be one
+// Claude is still writing: stop there and read it again next time. An
+// unreadable line with more after it is damage (a crash can leave a line of
+// zero bytes) and is skipped.
 function take(s, stdout) {
   let added = false;
-  for (const raw of stdout.split("\n")) {
+  const rows = stdout.split("\n").filter((r) => r.includes("\t"));
+  for (const [k, raw] of rows.entries()) {
     const tab = raw.indexOf("\t");
-    if (tab < 0) continue;
     const n = Number(raw.slice(0, tab)), body = raw.slice(tab + 1);
     let e;
     if (body.startsWith("STUB")) {
       e = { uuid: body.match(/"uuid":"([^"]*)"/)?.[1], parentUuid: body.match(/"parentUuid":"([^"]*)"/)?.[1] ?? null, stub: body.startsWith("STUB tool") ? "tool" : "skip" };
-    } else { try { e = JSON.parse(body); } catch (_e) { break; } }
+    } else {
+      try { e = JSON.parse(body); } catch (_e) { if (k === rows.length - 1) break; s.line = n; continue; }
+    }
     s.line = n;
     if (!e?.uuid || e.isSidechain) continue;
+    e.order = s.order.length;
+    s.order.push(e.uuid);
     s.byId.set(e.uuid, e);
     s.leaf = e.uuid;
     added = true;
@@ -53,13 +59,15 @@ function take(s, stdout) {
 
 // The conversation as it stands: from the newest entry back to the start
 // (rewinding branches it; a compaction links back through logicalParentUuid).
+// A parent that was lost (a damaged line) is bridged by the entry before it
+// in the file.
 function chain(s) {
   const out = [], seen = new Set();
   for (let e = s.byId.get(s.leaf); e && !seen.has(e.uuid);) {
     seen.add(e.uuid);
     out.push(e);
     const up = e.parentUuid ?? e.logicalParentUuid;
-    e = up ? s.byId.get(up) : null;
+    e = up ? s.byId.get(up) ?? (e.order > 0 ? s.byId.get(s.order[e.order - 1]) : null) : null;
   }
   return out.reverse();
 }
@@ -108,7 +116,7 @@ export function conversation(s) {
       turn = [];
     } else if (e.type === "attachment" && e.attachment?.type === "queued_command" && e.attachment.prompt) {
       out.push({ who: "you", text: String(e.attachment.prompt), at });
-    } else if (e.type === "assistant") {
+    } else if (e.type === "assistant" && e.message?.model !== "<synthetic>") { // not Claude Code's own placeholders
       const m = e.message ?? {};
       const text = (Array.isArray(m.content) ? m.content : []).filter((c) => c?.type === "text").map((c) => c.text ?? "").join("\n").trim();
       (turn ??= []).push({ text, at, end: m.stop_reason === "end_turn" });
@@ -129,7 +137,7 @@ export async function locate(term) {
   return file ? { term, on, file, pid: fg.pid, sid } : null;
 }
 
-export const open = (found) => ({ ...found, byId: new Map(), leaf: null, line: 0 });
+export const open = (found) => ({ ...found, byId: new Map(), order: [], leaf: null, line: 0 });
 
 // Reads what Claude added since last time. True when the conversation changed.
 export async function update(s) {
